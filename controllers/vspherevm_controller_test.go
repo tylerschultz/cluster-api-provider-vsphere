@@ -18,12 +18,16 @@ package controllers
 
 import (
 	goctx "context"
+	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+	govc "github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/vim25/mo"
+	vtypes "github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +47,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/record"
 	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services"
 	fake_svc "sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/fake"
+	"sigs.k8s.io/cluster-api-provider-vsphere/pkg/services/govmomi"
 	"sigs.k8s.io/cluster-api-provider-vsphere/test/helpers/vcsim"
 )
 
@@ -467,6 +472,169 @@ func TestRetrievingVCenterCredentialsFromCluster(t *testing.T) {
 	g.Expect(vCenterCondition.Status).To(Equal(corev1.ConditionTrue))
 }
 
+func TestDHCPOverridesSetInVMMetadata(t *testing.T) {
+	// initializing a fake server to replace the vSphere endpoint
+	model := simulator.VPX()
+	model.Host = 0
+
+	simr, err := vcsim.NewBuilder().WithModel(model).Build()
+	if err != nil {
+		t.Fatalf("unable to create simulator: %s", err)
+	}
+	defer simr.Destroy()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "creds-secret",
+			Namespace: "test",
+		},
+		Data: map[string][]byte{
+			identity.UsernameKey: []byte(simr.Username()),
+			identity.PasswordKey: []byte(simr.Password()),
+		},
+	}
+
+	vsphereCluster := &infrav1.VSphereCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "valid-vsphere-cluster",
+			Namespace: "test",
+		},
+		Spec: infrav1.VSphereClusterSpec{
+			IdentityRef: &infrav1.VSphereIdentityReference{
+				Kind: infrav1.SecretKind,
+				Name: secret.Name,
+			},
+		},
+	}
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "valid-cluster",
+			Namespace: "test",
+		},
+		Spec: clusterv1.ClusterSpec{
+			InfrastructureRef: &corev1.ObjectReference{
+				Name: vsphereCluster.Name,
+			},
+		},
+	}
+
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "test",
+			Labels: map[string]string{
+				clusterv1.ClusterLabelName: "valid-cluster",
+			},
+		},
+	}
+
+	initObjs := createMachineOwnerHierarchy(machine)
+
+	vsphereMachine := &infrav1.VSphereMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo-vm",
+			Namespace: "test",
+			Labels: map[string]string{
+				clusterv1.ClusterLabelName: "valid-cluster",
+			},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: clusterv1.GroupVersion.String(), Kind: "Machine", Name: "foo"}},
+		},
+	}
+
+	vsphereVM := &infrav1.VSphereVM{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "VSphereVM",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "DC0_C0_RP0_VM0",
+			Namespace: "test",
+			Labels: map[string]string{
+				clusterv1.ClusterLabelName: "valid-cluster",
+			},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: infrav1.GroupVersion.String(), Kind: "VSphereMachine", Name: "foo-vm"}},
+			// To make sure PatchHelper does not error out
+			ResourceVersion: "1234",
+		},
+		Spec: infrav1.VSphereVMSpec{
+			VirtualMachineCloneSpec: infrav1.VirtualMachineCloneSpec{
+				Server:     simr.ServerURL().Host,
+				Datacenter: "DC0",
+				Network: infrav1.NetworkSpec{
+					Devices: []infrav1.NetworkDeviceSpec{
+						{
+							NetworkName: "nw-1",
+							DHCP4:       true,
+							DHCP4Overrides: &infrav1.DHCPOverrides{
+								UseDNS: toBoolPtr(false),
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: infrav1.VSphereVMStatus{},
+	}
+
+	initObjs = append(initObjs, secret, vsphereVM, vsphereMachine, machine, cluster, vsphereCluster)
+	controllerMgrContext := fake.NewControllerManagerContext(initObjs...)
+
+	controllerContext := &context.ControllerContext{
+		ControllerManagerContext: controllerMgrContext,
+		Recorder:                 record.New(apirecord.NewFakeRecorder(100)),
+		Logger:                   log.Log,
+	}
+	r := vmReconciler{
+		ControllerContext: controllerContext,
+		VMService:         &govmomi.VMService{},
+	}
+
+	g := NewWithT(t)
+	_, err = r.Reconcile(goctx.Background(), ctrl.Request{NamespacedName: util.ObjectKey(vsphereVM)})
+	g.Expect(err).NotTo(HaveOccurred())
+
+	c, _ := govc.NewClient(ctx, simr.ServerURL(), true)
+	var obj mo.VirtualMachine
+	ref := vtypes.ManagedObjectReference{
+		Type:  "VirtualMachine",
+		Value: "vm-44",
+	}
+	err = c.RetrieveOne(goctx.Background(), ref, []string{"config.extraConfig"}, &obj)
+	g.Expect(err).NotTo(HaveOccurred())
+	expected := `
+instance-id: "DC0_C0_RP0_VM0"
+local-hostname: "DC0_C0_RP0_VM0"
+wait-on-network:
+  ipv4: true
+  ipv6: false
+network:
+  version: 2
+  ethernets:
+    id0:
+      match:
+        macaddress: "00:0c:29:33:34:38"
+      set-name: "eth0"
+      wakeonlan: true
+      dhcp4: true
+      dhcp4-overrides:
+        use-dns: false
+      dhcp6: false
+`
+	found := false
+	for _, ec := range obj.Config.ExtraConfig {
+		opt := ec.GetOptionValue()
+		if opt.Key == "guestinfo.metadata" {
+			found = true
+			v, _ := opt.Value.(string)
+			metadata, err := base64.StdEncoding.DecodeString(v)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(string(metadata)).To(Equal(expected))
+		}
+	}
+	g.Expect(found).To(BeTrue(), "did not find \"guestinfo.metadata\" on the vSphereVM")
+	// TODO: Should probably check both VMs have override
+}
+
 func createMachineOwnerHierarchy(machine *clusterv1.Machine) []client.Object {
 	machine.OwnerReferences = []metav1.OwnerReference{
 		{
@@ -508,4 +676,8 @@ func createMachineOwnerHierarchy(machine *clusterv1.Machine) []client.Object {
 		},
 	})
 	return objs
+}
+
+func toBoolPtr(b bool) *bool {
+	return &b
 }
